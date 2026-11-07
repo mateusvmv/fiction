@@ -50,6 +50,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <cassert>
 #include <cmath>
 #include <condition_variable>
@@ -57,6 +58,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <future>
 #include <iterator>
@@ -1419,6 +1421,44 @@ class operational_domain_impl
         return parameter_points;
     }
 
+    [[nodiscard]] OpDomain radial_search(const parameter_point& start_pp)
+    {
+        assert(num_dimensions >= 1 && "Radial search requires at least one sweep dimension");
+
+        const mockturtle::stopwatch stop{stats.time_total};
+        utils::check_deadline(params.operational_params.deadline);
+
+        // The radial search works in sweep-grid coordinates, not in physical parameter units.
+        const auto start_sp = to_step_point(start_pp);
+        const auto active_threads =
+            std::max(std::size_t{1}, std::min(params.number_of_threads, 2 * num_dimensions));
+
+        radial_context ctx{active_threads, start_sp, *this};
+
+        // Declare workers before threads: on exceptional exit, jthread destruction must join
+        // before the worker objects captured by the thread lambdas are destroyed.
+        {
+            std::vector<radial_worker> workers{};
+            workers.reserve(active_threads);
+
+            std::vector<std::jthread> threads{};
+            threads.reserve(active_threads > 0 ? active_threads - 1 : 0);
+
+            for (std::size_t t_id = 0; t_id < active_threads; ++t_id)
+            {
+                workers.emplace_back(t_id, active_threads, ctx, *this);
+            }
+            for (std::size_t t_id = 1; t_id < active_threads; ++t_id)
+            {
+                threads.emplace_back([t_id, &workers]() { workers[t_id].run(); });
+            }
+            workers[0].run();
+        }  // jthreads join before workers are destroyed
+
+        log_stats();
+        return op_domain;
+    }
+
   private:
     /**
      * Builds the indices and values of each validated sweep dimension.
@@ -2361,6 +2401,418 @@ class operational_domain_impl
 
         stats.num_total_parameter_points = num_parameter_points;
     }
+
+    /**
+     * Shared state for the radial search.
+     *
+     * The radius is measured in sweep-grid cells using the Chebyshev (L-infinity) metric. A shell
+     * at radius r contains every in-range point p for which max_d(abs(p[d] - start[d])) == r.
+     */
+    struct radial_context
+    {
+        const step_point         start_sp;
+        const operational_status start_status;
+        const operational_status desired_status;
+        const std::size_t        num_dimensions;
+        const std::size_t        num_directions;
+
+        // Expansion: one task per positive/negative coordinate ray.
+        std::atomic<std::size_t> expansion_task_atomic{0};
+        std::atomic<std::size_t> min_radius{std::numeric_limits<std::size_t>::max()};
+        std::size_t              current_radius{0};
+
+        // Contraction: all workers read shell_points; each worker claims a unique index via task_atomic.
+        std::vector<step_point> shell_points{};
+        std::atomic<std::size_t> task_atomic{0};
+        std::atomic<bool>       shell_matches_start_status{true};
+        bool                    running{false};
+
+        // Worker exceptions are captured and rethrown on the calling thread after all workers have joined.
+        std::atomic<bool> failed{false};
+        std::mutex        failure_mutex{};
+        std::exception_ptr failure{};
+
+        // All workers execute the same phase sequence.
+        std::barrier<> barrier;
+
+        radial_context(const std::size_t threads, step_point start, operational_domain_impl& impl) :
+                start_sp{std::move(start)},
+                start_status{impl.is_step_point_operational(start_sp)},
+                desired_status{start_status == operational_status::OPERATIONAL ?
+                                   operational_status::NON_OPERATIONAL : operational_status::OPERATIONAL},
+                num_dimensions{start_sp.step_values.size()},
+                num_directions{2 * num_dimensions},
+                barrier{static_cast<std::ptrdiff_t>(threads)}
+        {}
+
+        /** Atomically lowers the best transition radius found by the expansion phase. */
+        void update_min_radius(const std::size_t candidate) noexcept
+        {
+            auto current = min_radius.load(std::memory_order_relaxed);
+            while (candidate < current &&
+                   !min_radius.compare_exchange_weak(current, candidate, std::memory_order_relaxed,
+                                                      std::memory_order_relaxed))
+            {}
+        }
+
+        /** Stores the first worker exception and asks all workers to stop doing useful work. */
+        void capture_failure(const std::exception_ptr& error)
+        {
+            {
+                const std::scoped_lock lock{failure_mutex};
+                if (!failure)
+                {
+                    failure = error;
+                }
+            }
+            failed.store(true, std::memory_order_release);
+        }
+
+        /** Rethrows a worker exception on the calling thread, if one was recorded. */
+        void rethrow_failure()
+        {
+            std::exception_ptr error{};
+            {
+                const std::scoped_lock lock{failure_mutex};
+                error = failure;
+            }
+            if (error)
+            {
+                std::rethrow_exception(error);
+            }
+        }
+    };
+
+    /**
+     * Worker for the radial search's expansion and shell-contraction phases.
+     */
+    struct radial_worker
+    {
+        const std::size_t thread_id;
+        const std::size_t total_threads;
+        radial_context&   ctx;
+        operational_domain_impl& impl;
+
+        radial_worker(const std::size_t t_id, const std::size_t total, radial_context& c,
+                      operational_domain_impl& i) :
+                thread_id{t_id},
+                total_threads{total},
+                ctx{c},
+                impl{i}
+        {}
+
+        /**
+         * Casts rays in both directions along every sweep dimension. The smallest transition distance
+         * is used as the outermost shell radius. If a ray reaches the grid boundary first, its first
+         * out-of-range distance is considered, as in the original radial-search setup.
+         */
+        void expand()
+        {
+            if (thread_id == 0)
+            {
+                ctx.expansion_task_atomic.store(0, std::memory_order_relaxed);
+                ctx.min_radius.store(std::numeric_limits<std::size_t>::max(), std::memory_order_relaxed);
+            }
+            ctx.barrier.arrive_and_wait();
+
+            while (!ctx.failed.load(std::memory_order_acquire))
+            {
+                const auto direction = ctx.expansion_task_atomic.fetch_add(1, std::memory_order_relaxed);
+                if (direction >= ctx.num_directions)
+                {
+                    break;
+                }
+
+                try
+                {
+                    const auto dimension = direction / 2;
+                    const bool positive   = direction % 2 == 0;
+                    const auto center     = ctx.start_sp.step_values.at(dimension);
+                    const auto extent    = impl.values.at(dimension).size();
+                    const auto available = positive ? extent - 1 - center : center;
+
+                    // If no transition is encountered, the first out-of-range step ends this ray.
+                    auto stopping_radius = available + 1;
+
+                    for (std::size_t radius = 1; radius <= available; ++radius)
+                    {
+                        // This ray cannot improve the smallest stopping distance already found.
+                        if (radius >= ctx.min_radius.load(std::memory_order_relaxed))
+                        {
+                            break;
+                        }
+
+                        utils::check_deadline(impl.params.operational_params.deadline);
+
+                        auto step_values = ctx.start_sp.step_values;
+                        step_values[dimension] = positive ? center + radius : center - radius;
+                        const auto status = impl.is_step_point_operational(step_point{std::move(step_values)});
+
+                        if (status == ctx.desired_status)
+                        {
+                            stopping_radius = radius;
+                            break;
+                        }
+                    }
+
+                    if (!ctx.failed.load(std::memory_order_acquire))
+                    {
+                        ctx.update_min_radius(stopping_radius);
+                    }
+                }
+                catch (...)
+                {
+                    ctx.capture_failure(std::current_exception());
+                }
+            }
+
+            ctx.barrier.arrive_and_wait();
+            if (thread_id == 0 && !ctx.failed.load(std::memory_order_acquire))
+            {
+                const auto radius = ctx.min_radius.load(std::memory_order_relaxed);
+
+                // The first out-of-range radius can be one larger than every in-grid displacement
+                // (e.g. a centered seed in a small, symmetric grid). Clamp it to the largest shell
+                // that actually exists in the grid.
+                std::size_t max_reachable_radius = 0;
+                for (std::size_t d = 0; d < ctx.num_dimensions; ++d)
+                {
+                    const auto extent = impl.values.at(d).size();
+                    const auto center = ctx.start_sp.step_values.at(d);
+                    max_reachable_radius =
+                        std::max(max_reachable_radius, std::max(center, extent - 1 - center));
+                }
+
+                const auto requested_radius =
+                    radius == std::numeric_limits<std::size_t>::max() ? max_reachable_radius : radius;
+                ctx.current_radius = std::min(requested_radius, max_reachable_radius);
+            }
+            ctx.barrier.arrive_and_wait();
+        }
+
+        /**
+         * Builds one clipped n-dimensional Chebyshev shell without duplicates.
+         *
+         * A point belongs to the shell iff at least one coordinate is exactly `radius` from the center
+         * and all other coordinates are at most `radius` away. Each point is emitted by the first
+         * dimension that reaches the radius; earlier dimensions are therefore restricted to radius-1.
+         */
+        [[nodiscard]] static std::vector<step_point>
+        make_shell(const step_point& center, const std::size_t radius,
+                   const std::vector<std::size_t>& extents)
+        {
+            const auto dimensions = center.step_values.size();
+            std::vector<step_point> shell{};
+
+            if (dimensions == 0 || extents.size() != dimensions)
+            {
+                return shell;
+            }
+            for (std::size_t d = 0; d < dimensions; ++d)
+            {
+                if (extents[d] == 0 || center.step_values[d] >= extents[d])
+                {
+                    return shell;
+                }
+            }
+
+            if (radius == 0)
+            {
+                shell.emplace_back(center.step_values);
+                return shell;
+            }
+
+            std::vector<std::size_t> coordinate(dimensions);
+            std::vector<std::size_t> lower(dimensions);
+            std::vector<std::size_t> upper(dimensions);
+
+            const auto enumerate_face = [&](const auto& self, const std::size_t dimension) -> void
+            {
+                if (dimension == dimensions)
+                {
+                    shell.emplace_back(coordinate);
+                    return;
+                }
+
+                for (auto value = lower[dimension];; ++value)
+                {
+                    coordinate[dimension] = value;
+                    self(self, dimension + 1);
+                    if (value == upper[dimension])
+                    {
+                        break;
+                    }
+                }
+            };
+
+            for (std::size_t face_dimension = 0; face_dimension < dimensions; ++face_dimension)
+            {
+                // The first coordinate attaining the shell radius is the unique owner of a point.
+                for (int sign = 0; sign < 2; ++sign)
+                {
+                    const bool positive = sign == 1;
+                    const auto center_coordinate = center.step_values[face_dimension];
+                    const auto extent            = extents[face_dimension];
+
+                    if ((!positive && radius > center_coordinate) ||
+                        (positive && radius > extent - 1 - center_coordinate))
+                    {
+                        continue;
+                    }
+
+                    const auto fixed_coordinate =
+                        positive ? center_coordinate + radius : center_coordinate - radius;
+
+                    for (std::size_t d = 0; d < dimensions; ++d)
+                    {
+                        const auto c = center.step_values[d];
+                        const auto e = extents[d];
+                        const auto outer_lower = radius > c ? 0 : c - radius;
+                        const auto outer_upper = radius > e - 1 - c ? e - 1 : c + radius;
+
+                        if (d < face_dimension)
+                        {
+                            const auto inner_radius = radius - 1;
+                            lower[d] = inner_radius > c ? 0 : c - inner_radius;
+                            upper[d] = inner_radius > e - 1 - c ? e - 1 : c + inner_radius;
+                        }
+                        else if (d == face_dimension)
+                        {
+                            lower[d] = fixed_coordinate;
+                            upper[d] = fixed_coordinate;
+                        }
+                        else
+                        {
+                            lower[d] = outer_lower;
+                            upper[d] = outer_upper;
+                        }
+                    }
+
+                    enumerate_face(enumerate_face, 0);
+                }
+            }
+
+            return shell;
+        }
+
+        /**
+         * Shrinks the hypercube one grid cell at a time. Every point on every shell is evaluated.
+         * The contraction stops at the first shell whose points all have the seed's status. In the
+         * normal use case, where the seed is operational, this means the shell contains only operational points.
+         */
+        void contract()
+        {
+            std::vector<std::size_t> extents{};
+            extents.reserve(ctx.num_dimensions);
+            for (std::size_t d = 0; d < ctx.num_dimensions; ++d)
+            {
+                extents.push_back(impl.values.at(d).size());
+            }
+
+            if (thread_id == 0)
+            {
+                try
+                {
+                    ctx.shell_points = make_shell(ctx.start_sp, ctx.current_radius, extents);
+
+                    // The expansion phase clamps the radius, so an empty shell is unexpected. Keep
+                    // the fallback defensive in case the sweep grid changes independently later.
+                    while (ctx.shell_points.empty() && ctx.current_radius > 0)
+                    {
+                        --ctx.current_radius;
+                        ctx.shell_points = make_shell(ctx.start_sp, ctx.current_radius, extents);
+                    }
+
+                    ctx.task_atomic.store(0, std::memory_order_relaxed);
+                    ctx.shell_matches_start_status.store(true, std::memory_order_relaxed);
+                    ctx.running = !ctx.shell_points.empty();
+                }
+                catch (...)
+                {
+                    ctx.capture_failure(std::current_exception());
+                    ctx.running = false;
+                }
+            }
+            ctx.barrier.arrive_and_wait();
+
+            while (ctx.running)
+            {
+                if (!ctx.failed.load(std::memory_order_acquire))
+                {
+                    while (true)
+                    {
+                        const auto task = ctx.task_atomic.fetch_add(1, std::memory_order_relaxed);
+                        if (task >= ctx.shell_points.size())
+                        {
+                            break;
+                        }
+
+                        try
+                        {
+                            utils::check_deadline(impl.params.operational_params.deadline);
+                            const auto status = impl.is_step_point_operational(ctx.shell_points[task]);
+                            if (status != ctx.start_status)
+                            {
+                                ctx.shell_matches_start_status.store(false, std::memory_order_relaxed);
+                            }
+                        }
+                        catch (...)
+                        {
+                            ctx.capture_failure(std::current_exception());
+                            break;
+                        }
+                    }
+                }
+
+                // All points on this shell have been evaluated before thread 0 decides whether to shrink.
+                ctx.barrier.arrive_and_wait();
+
+                if (thread_id == 0)
+                {
+                    if (ctx.failed.load(std::memory_order_acquire) ||
+                        ctx.shell_matches_start_status.load(std::memory_order_relaxed) || ctx.current_radius == 0)
+                    {
+                        ctx.running = false;
+                    }
+                    else
+                    {
+                        try
+                        {
+                            --ctx.current_radius;
+                            ctx.shell_points = make_shell(ctx.start_sp, ctx.current_radius, extents);
+                            ctx.task_atomic.store(0, std::memory_order_relaxed);
+                            ctx.shell_matches_start_status.store(true, std::memory_order_relaxed);
+                            ctx.running = !ctx.shell_points.empty();
+                        }
+                        catch (...)
+                        {
+                            ctx.capture_failure(std::current_exception());
+                            ctx.running = false;
+                        }
+                    }
+                }
+
+                // Publishes the next shell, aggregate status, and running flag to every worker.
+                ctx.barrier.arrive_and_wait();
+            }
+        }
+
+        /** Executes both phases and rethrows worker failures only on the calling thread. */
+        void run()
+        {
+            expand();
+            if (!ctx.failed.load(std::memory_order_acquire))
+            {
+                contract();
+            }
+
+            ctx.barrier.arrive_and_wait();
+            if (thread_id == 0)
+            {
+                ctx.rethrow_failure();
+            }
+        }
+    };
 };
 
 }  // namespace detail
@@ -2733,6 +3185,36 @@ critical_temperature_domain_contour_tracing(const layout& lyt, const std::vector
     fiction::sidb::simulation::logic::detail::operational_domain_impl<critical_temperature_domain> p{lyt, spec, params,
                                                                                                      st};
     const auto result = p.contour_tracing(samples);
+
+    if (stats != nullptr)
+    {
+        *stats = st;
+    }
+
+    return result;
+}
+
+/**
+ * Computes the operational domain by casting parallelized rays outward from a starting parameter point
+ * to find the distance (radius) to the operational boundary, complete with automated hole refinement.
+ *
+ * @param lyt Layout to compute the operational domain for.
+ * @param spec Expected Boolean function of the layout given as a multi-output truth table.
+ * @param start_point Seed parameter point to cast rays from.
+ * @param params Operational domain computation parameters.
+ * @param stats Operational domain computation statistics.
+ * @return The operational domain containing boundary points.
+ */
+[[nodiscard]] inline operational_domain
+operational_domain_radial_search(const layout& lyt, const std::vector<kitty::dynamic_truth_table>& spec,
+                                 const parameter_point& start_point,
+                                 const operational_domain_params& params = {}, operational_domain_stats* stats = nullptr)
+{
+    detail::validate_operational_domain_params(lyt, params, 1, "Radial search");
+
+    operational_domain_stats st{};
+    fiction::sidb::simulation::logic::detail::operational_domain_impl<operational_domain> p{lyt, spec, params, st};
+    const auto result = p.radial_search(start_point);
 
     if (stats != nullptr)
     {

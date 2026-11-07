@@ -1429,15 +1429,17 @@ class operational_domain_impl
      *
      * The seed is first mapped to the sweep grid by rounding each coordinate up to the first grid value that is
      * greater than or equal to it. Expansion samples both axis-aligned rays in every dimension and uses the smallest
-     * detected status-transition distance as the initial radius (or the grid boundary when a ray has no transition).
-     * Contraction then examines clipped n-dimensional shells in decreasing radius order. A shell is rejected as soon
-     * as one point differs from the seed status; the first shell whose points all match is accepted.
+     * actual status-transition distance as the initial radius. Rays that reach a grid edge without a transition do
+     * not constrain that radius; if no ray finds a transition, the initial clipped hypercube covers the entire grid.
+     * Contraction examines the boundaries of clipped n-dimensional hypercubes in decreasing radius order. A shell is
+     * rejected as soon as one point differs from the seed status; the first shell whose points all match is accepted.
      *
      * The radius is measured in grid cells using the Chebyshev (L-infinity) metric. This is a radial sampling
      * heuristic, not an exhaustive domain computation: the returned domain contains points evaluated by the rays and
      * shells, but unvisited points in the accepted shell's interior are neither evaluated nor inferred.
      *
-     * @param start_pp Seed parameter point. Coordinates between grid values are rounded up independently.
+     * @param start_pp Seed parameter point. Coordinates between grid values are rounded up independently; exact
+     * grid endpoints are valid seed coordinates.
      * @return The classifications of the parameter points evaluated during expansion and contraction.
      * @throws std::invalid_argument if the seed has the wrong number of dimensions, contains a non-finite coordinate,
      * or lies outside a sweep range.
@@ -2459,8 +2461,10 @@ class operational_domain_impl
     /**
      * Shared state for the radial search.
      *
-     * The radius is measured in sweep-grid cells using the Chebyshev (L-infinity) metric. A shell
-     * at radius r contains every in-range point p for which max_d(abs(p[d] - start[d])) == r.
+     * The radius is measured in sweep-grid cells using the Chebyshev (L-infinity) metric. A shell is
+     * the boundary of the axis-aligned hypercube centered at the seed, clipped to the sweep grid. Thus,
+     * when the radius reaches `max_reachable_radius`, the clipped hypercube is the entire grid and its
+     * shell contains the complete grid border.
      */
     struct radial_context
     {
@@ -2625,9 +2629,10 @@ class operational_domain_impl
         {}
 
         /**
-         * Casts rays in both directions along every sweep dimension. The smallest transition distance
-         * is used as the outermost shell radius. If a ray reaches the grid boundary first, its first
-         * out-of-range distance is considered, as in the original radial-search setup.
+         * Casts rays in both directions along every sweep dimension. The smallest actual status-transition
+         * distance is used as the outermost shell radius. A ray that reaches the grid boundary without finding
+         * a transition contributes no candidate; if no ray finds a transition, contraction starts at
+         * `max_reachable_radius`, where the clipped hypercube covers the entire sweep grid.
          */
         void expand()
         {
@@ -2652,11 +2657,9 @@ class operational_domain_impl
                     // Reuse one point for the entire ray instead of allocating/copying its coordinate
                     // vector for every distance along that ray.
                     step_point point{ctx.start_sp.step_values};
-                    auto stopping_radius = direction.available + 1;
-
                     for (std::size_t radius = 1; radius <= direction.available; ++radius)
                     {
-                        // This ray cannot improve the smallest stopping distance already found.
+                        // This ray cannot improve the smallest transition distance already found.
                         if (radius >= ctx.min_radius.load(std::memory_order_relaxed))
                         {
                             break;
@@ -2668,14 +2671,11 @@ class operational_domain_impl
 
                         if (impl.is_step_point_operational(point) == ctx.desired_status)
                         {
-                            stopping_radius = radius;
+                            // Only an actual status transition constrains the initial radius. Reaching the
+                            // grid boundary without a transition must not pull the radius inward.
+                            ctx.update_min_radius(radius);
                             break;
                         }
-                    }
-
-                    if (!ctx.failed.load(std::memory_order_acquire))
-                    {
-                        ctx.update_min_radius(stopping_radius);
                     }
                 }
                 catch (...)
@@ -2687,17 +2687,20 @@ class operational_domain_impl
             ctx.barrier.arrive_and_wait();
             if (thread_id == 0 && !ctx.failed.load(std::memory_order_acquire))
             {
-                const auto radius = ctx.min_radius.load(std::memory_order_relaxed);
-                const auto requested_radius =
-                    radius == std::numeric_limits<std::size_t>::max() ? ctx.max_reachable_radius : radius;
-                ctx.current_radius = std::min(requested_radius, ctx.max_reachable_radius);
+                const auto transition_radius = ctx.min_radius.load(std::memory_order_relaxed);
+                // If no ray found a transition, inspect the boundary of the complete sweep grid first.
+                ctx.current_radius = transition_radius == std::numeric_limits<std::size_t>::max() ?
+                                        ctx.max_reachable_radius :
+                                        transition_radius;
             }
             ctx.barrier.arrive_and_wait();
         }
 
         /**
-         * Prepares the flattened face ranges for one clipped n-dimensional Chebyshev shell.
-         * Each point belongs to the first dimension that reaches the shell radius, so faces do not overlap.
+         * Prepares the flattened face ranges for the boundary of one n-dimensional Chebyshev hypercube clipped
+         * to the sweep grid. Each point belongs to the first dimension in which it lies on a clipped face, so
+         * faces do not overlap. At `max_reachable_radius`, the clipped hypercube is the entire grid and this
+         * produces every point on the grid border, including faces closer to the seed than the farthest face.
          */
         void prepare_shell(shell_work& shell)
         {
@@ -2709,55 +2712,58 @@ class operational_domain_impl
                 return;
             }
 
-            if (shell.radius == 0)
+            const auto radius = shell.radius;
+            std::vector<std::size_t> clipped_lower(ctx.num_dimensions);
+            std::vector<std::size_t> clipped_upper(ctx.num_dimensions);
+
+            // Compute the clipped hypercube once. Coordinates at a sweep-grid edge become faces of the
+            // clipped hypercube even when that edge is closer than `radius` to the seed.
+            for (std::size_t d = 0; d < ctx.num_dimensions; ++d)
             {
-                shell_face face{};
-                face.lower  = ctx.start_sp.step_values;
-                face.upper  = ctx.start_sp.step_values;
-                face.offset = 0;
-                face.count  = 1;
-                shell.faces.push_back(std::move(face));
-                shell.point_count = 1;
-                return;
+                const auto center = ctx.start_sp.step_values[d];
+                const auto extent = ctx.extents[d];
+
+                clipped_lower[d] = radius > center ? 0 : center - radius;
+                clipped_upper[d] = radius > extent - 1 - center ? extent - 1 : center + radius;
             }
 
-            const auto radius = shell.radius;
             shell.faces.reserve(ctx.num_directions);
 
+            // Assign each boundary point to the first dimension in which it touches a face. Earlier
+            // dimensions are restricted to the strict interior; later dimensions span the full interval.
             for (std::size_t face_dimension = 0; face_dimension < ctx.num_dimensions; ++face_dimension)
             {
-                const auto center_coordinate = ctx.start_sp.step_values[face_dimension];
-                const auto extent            = ctx.extents[face_dimension];
-
                 for (int sign = 0; sign < 2; ++sign)
                 {
                     const bool positive = sign == 1;
-                    if ((!positive && radius > center_coordinate) ||
-                        (positive && radius > extent - 1 - center_coordinate))
+                    if (positive && clipped_upper[face_dimension] == clipped_lower[face_dimension])
                     {
+                        // A one-coordinate interval has only one distinct face.
                         continue;
                     }
 
                     const auto fixed_coordinate =
-                        positive ? center_coordinate + radius : center_coordinate - radius;
+                        positive ? clipped_upper[face_dimension] : clipped_lower[face_dimension];
 
                     shell_face face{};
                     face.lower.resize(ctx.num_dimensions);
                     face.upper.resize(ctx.num_dimensions);
 
                     std::size_t point_count = 1;
+                    bool        empty_face  = false;
                     for (std::size_t d = 0; d < ctx.num_dimensions; ++d)
                     {
-                        const auto center = ctx.start_sp.step_values[d];
-                        const auto size   = ctx.extents[d];
-                        const auto outer_lower = radius > center ? 0 : center - radius;
-                        const auto outer_upper = radius > size - 1 - center ? size - 1 : center + radius;
-
                         if (d < face_dimension)
                         {
-                            const auto inner_radius = radius - 1;
-                            face.lower[d] = inner_radius > center ? 0 : center - inner_radius;
-                            face.upper[d] = inner_radius > size - 1 - center ? size - 1 : center + inner_radius;
+                            // If an earlier dimension has no strict interior, all points already belong
+                            // to one of its faces and this face contributes no unique points.
+                            if (clipped_upper[d] - clipped_lower[d] <= 1)
+                            {
+                                empty_face = true;
+                                break;
+                            }
+                            face.lower[d] = clipped_lower[d] + 1;
+                            face.upper[d] = clipped_upper[d] - 1;
                         }
                         else if (d == face_dimension)
                         {
@@ -2766,8 +2772,8 @@ class operational_domain_impl
                         }
                         else
                         {
-                            face.lower[d] = outer_lower;
-                            face.upper[d] = outer_upper;
+                            face.lower[d] = clipped_lower[d];
+                            face.upper[d] = clipped_upper[d];
                         }
 
                         const auto width = face.upper[d] - face.lower[d] + 1;
@@ -2776,6 +2782,11 @@ class operational_domain_impl
                             throw std::length_error{"radial shell is too large"};
                         }
                         point_count *= width;
+                    }
+
+                    if (empty_face)
+                    {
+                        continue;
                     }
 
                     if (point_count > std::numeric_limits<std::size_t>::max() - shell.point_count)
@@ -3439,15 +3450,18 @@ critical_temperature_domain_contour_tracing(const layout& lyt, const std::vector
 /**
  * Computes a radial approximation of the operational domain around a seed parameter point.
  *
- * The algorithm first evaluates axis-aligned rays in both directions of every sweep dimension. The nearest detected
- * transition from the seed's operational status (or the nearest sweep-grid edge when a ray has no transition) sets
- * the initial radius. It then contracts clipped n-dimensional Chebyshev shells, starting at that radius and moving
- * inward. A shell is rejected as soon as one of its points differs from the seed's status; the first shell whose
- * points all match the seed is accepted.
+ * The algorithm first evaluates axis-aligned rays in both directions of every sweep dimension. The nearest actual
+ * transition from the seed's operational status sets the initial radius. Rays that reach a grid edge without finding
+ * a transition do not constrain that radius; if no ray finds a transition, the initial radius is large enough for the
+ * clipped hypercube to cover the entire sweep grid. It then contracts clipped n-dimensional Chebyshev hypercubes,
+ * examining each clipped hypercube's boundary as it moves inward. A shell is rejected as soon as one of its points
+ * differs from the seed's status; the first shell whose points all match the seed is accepted.
  *
  * The radius is measured in sweep-grid cells, not physical parameter units. Each seed coordinate is mapped to the
- * first sweep-grid value greater than or equal to it. The returned domain contains the seed, ray samples, and shell
- * points that were actually evaluated. It is intentionally partial: points in the accepted shell's interior are not
+ * first sweep-grid value greater than or equal to it; coordinates equal to either generated grid endpoint are valid.
+ * If no transition is found on any ray, the first contraction shell is the complete border of the sweep grid. The
+ * returned domain contains the seed, ray samples, and points on shells that were actually evaluated. It is
+ * intentionally partial: points in the accepted shell's interior are not
  * exhaustively evaluated or inferred, and off-axis features not intersecting the sampled shells may remain unseen.
  * The algorithm supports any positive number of sweep dimensions.
  *

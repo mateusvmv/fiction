@@ -2652,7 +2652,7 @@ class operational_domain_impl
                     const auto initial_radius = transition_radius == std::numeric_limits<std::size_t>::max()
                                                     ? max_euclidean_radius
                                                     : transition_radius;
-                    ctx.current_radius = std::min(initial_radius * 2, max_euclidean_radius);
+                    ctx.current_radius = std::min(initial_radius, max_euclidean_radius);
                 }
                 ctx.barrier.arrive_and_wait();
             }

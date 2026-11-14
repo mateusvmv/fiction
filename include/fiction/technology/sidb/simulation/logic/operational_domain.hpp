@@ -283,6 +283,71 @@ class operational_domain : public sidb::simulation::domain<parameter_point, oper
         return dimensions.size();
     }
 
+    /**
+     * Returns the singular parameter point inside the operational domain 
+     * that has the highest domain distance to the border (domain center).
+     * 
+     * @return The central parameter point.
+     */
+    [[nodiscard]] parameter_point domain_center() const
+    {
+        parameter_point center{};
+        double max_dist = -std::numeric_limits<double>::infinity();
+        this->for_each([&](const auto& pp, const auto& status)
+        {
+            if (std::get<0>(status) == operational_status::OPERATIONAL)
+            {
+                double dist = domain_distance(pp);
+                if (dist > max_dist)
+                {
+                    max_dist = dist;
+                    center = pp;
+                }
+            }
+        });
+        if (max_dist < 0.0)
+        {
+            throw std::runtime_error("Operational domain is empty.");
+        }
+        return center;
+    }
+
+    /**
+     * Computes the Euclidean distance from a parameter starting point to 
+     * the furthest point within the operational domain.
+     *
+     * @param target_point The target operational point.
+     * @param start_point  The parameter starting point.
+     * @return The distance to the operational domain border
+     */
+    [[nodiscard]] double domain_distance(const parameter_point& start_point) const
+    {        
+        const auto& p1 = start_point.get_parameters();
+        double dist_to_op  = std::numeric_limits<double>::infinity();
+        double dist_to_nop = std::numeric_limits<double>::infinity();
+        this->for_each([&](const auto &pp, const auto &status)
+        {
+            const auto &p2 = pp.get_parameters();
+            double dist = 0.0;
+            for (std::size_t i = 0; i < p1.size(); ++i)
+            {
+                double diff = p1[i] - p2[i];
+                dist += diff * diff;
+            }
+
+            if (std::get<0>(status) == operational_status::OPERATIONAL)
+            {
+                dist_to_op = std::min(dist_to_op, dist);
+            }
+            else
+            {
+                dist_to_nop = std::min(dist_to_nop, dist);
+            }
+        });
+
+        return dist_to_nop - dist_to_op;
+    }
+
   private:
     /**
      * The dimensions to sweep over. The first dimension is the x dimension, the second dimension is the y dimension,
@@ -1464,8 +1529,7 @@ class operational_domain_impl
         {
             throw std::length_error{"radial search has too many sweep dimensions"};
         }
-        const auto active_threads =
-            std::max(std::size_t{1}, std::min(params.number_of_threads, 2 * num_dimensions));
+        const auto active_threads = number_of_threads;
 
         radial_context ctx{active_threads, start_sp, *this};
 

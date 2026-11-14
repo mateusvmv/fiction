@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2018 - 2023 Marcel Walter
- * Copyright (c) 2023 - present Chair for Design Automation, Technical University of Munich
+ * Copyright (c) 2018 - 2026 Marcel Walter
+ * Copyright (c) 2026 - present Chair for Design Automation, Technical University of Munich
  * All rights reserved.
  *
  * SPDX-License-Identifier: MIT
@@ -37,6 +37,7 @@
 #include "fiction/utils/execution_timeout.hpp"
 #include "fiction/utils/math/math_utils.hpp"
 #include "fiction/utils/progress.hpp"
+#include "fiction/utils/thread_pool.hpp"
 #include "fiction/utils/stl/hash.hpp"
 
 #include <btree.h>
@@ -942,7 +943,7 @@ class operational_domain_impl
             {
                 for (std::size_t i = 0; i < number_of_threads; ++i)
                 {
-                    workers.emplace_back(std::async(std::launch::async, worker, i));
+                    workers.emplace_back(run_async([worker, i]() { worker(i); }));
                 }
 
                 for (auto& worker_result : workers)
@@ -1290,7 +1291,7 @@ class operational_domain_impl
                                 break;
                             }
                         }
-                        workers.emplace_back(std::async(std::launch::async, worker));
+                        workers.emplace_back(run_async(worker));
                     }
                 }
                 for (auto& result : workers)
@@ -1354,20 +1355,18 @@ class operational_domain_impl
                 break;  // no more work to distribute
             }
 
-            threads.emplace_back(
-                std::async(std::launch::async,
-                           [this, &cd, i, start, end, &all_index_combinations]
-                           {
-                               const utils::worker_progress_scope worker_scope{worker_progress, i};
-                               std::size_t                        completed{};
-                               worker_progress.update(i, "parameter points", 0, end - start);
-                               for (auto it = all_index_combinations.cbegin() + static_cast<int64_t>(start);
-                                    it != all_index_combinations.cbegin() + static_cast<int64_t>(end); ++it)
-                               {
-                                   is_step_point_suitable(cd, step_point{*it});  // construct a step_point
-                                   worker_progress.update(i, "parameter points", ++completed, end - start);
-                               }
-                           }));
+            threads.emplace_back(run_async([this, &cd, i, start, end, &all_index_combinations]
+            {
+                const utils::worker_progress_scope worker_scope{worker_progress, i};
+                std::size_t                        completed{};
+                worker_progress.update(i, "parameter points", 0, end - start);
+                for (auto it = all_index_combinations.cbegin() + static_cast<int64_t>(start);
+                        it != all_index_combinations.cbegin() + static_cast<int64_t>(end); ++it)
+                {
+                    is_step_point_suitable(cd, step_point{*it});  // construct a step_point
+                    worker_progress.update(i, "parameter points", ++completed, end - start);
+                }
+            }));
         }
 
         // wait for all threads to complete
@@ -1533,15 +1532,15 @@ class operational_domain_impl
 
         radial_context ctx{active_threads, start_sp, *this};
 
-        // Declare workers before threads: on exceptional exit, jthread destruction must join before the worker
-        // objects captured by the thread lambdas are destroyed. If the OS refuses a worker thread, drop the missing
+        // Declare workers before threads: on exceptional exit, thread destruction must join before the worker
+        // objects captured by the thread lambdas are destroyed. If pool or async task creation fails, drop missing
         // barrier participants and continue with the workers that were successfully created.
         {
             std::vector<radial_worker> workers{};
             workers.reserve(active_threads);
 
-            std::vector<std::jthread> threads{};
-            threads.reserve(active_threads - 1);
+            std::vector<std::future<void>> worker_futures{};
+            worker_futures.reserve(active_threads - 1);
 
             for (std::size_t t_id = 0; t_id < active_threads; ++t_id)
             {
@@ -1553,7 +1552,7 @@ class operational_domain_impl
             {
                 try
                 {
-                    threads.emplace_back([next_worker, &workers]() { workers[next_worker].run(); });
+                    worker_futures.emplace_back(run_async([next_worker, &workers]() { workers[next_worker].run(); }));
                 }
                 catch (const std::system_error&)
                 {
@@ -1573,13 +1572,34 @@ class operational_domain_impl
             }
 
             workers[0].run();
-        }  // jthreads join before workers are destroyed
+
+            for (auto& fut : worker_futures)
+            {
+                fut.get();
+            }
+        }  // futures join before workers are destroyed
 
         log_stats();
         return op_domain;
     }
 
   private:
+    /**
+     * Executes asynchronous tasks using the global thread pool if active, or `std::async` on demand otherwise.
+     */
+    template <typename F>
+    auto run_async(F&& f)
+    {
+        if (auto* pool = fiction::utils::operational_domain_thread_pool_context::get_active_pool(); pool != nullptr)
+        {
+            return pool->enqueue(std::forward<F>(f));
+        }
+        else
+        {
+            return std::async(std::launch::async, std::forward<F>(f));
+        }
+    }
+
     /**
      * Builds the indices and values of each validated sweep dimension.
      *
@@ -2106,7 +2126,7 @@ class operational_domain_impl
                 break;  // no more work to distribute
             }
 
-            threads.emplace_back(std::async(std::launch::async, worker, i, start, end));
+            threads.emplace_back(run_async([worker, i, start, end]() { worker(i, start, end); }));
         }
 
         // wait for all threads to complete
@@ -2482,7 +2502,7 @@ class operational_domain_impl
         {
             for (std::size_t i = 0; i < number_of_threads; ++i)
             {
-                workers.emplace_back(std::async(std::launch::async, worker));
+                workers.emplace_back(run_async(worker));
             }
             for (auto& result : workers)
             {
